@@ -1,0 +1,76 @@
+name: Scrape Test 30min V7
+
+on:
+  workflow_dispatch:
+    inputs:
+      items_json:
+        description: '批量 JSON 数组'
+        required: false
+        default: ''
+      single_item_timeout:
+        description: '单饰品超时(秒)'
+        required: false
+        default: '120'
+      chart_scroll_times:
+        description: 'K线图翻页次数'
+        required: false
+        default: '5'
+      max_retries:
+        description: '最大重试次数'
+        required: false
+        default: '1'
+
+concurrency:
+  group: scrape-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-python-v1
+
+      - name: Install playwright
+        run: pip install playwright
+
+      - name: Install Playwright Browsers (cache miss)
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: python -m playwright install chromium
+
+      - name: Install browser dependencies (cache hit)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: python -m playwright install-deps chromium
+
+      - name: Run scrape
+        env:
+          INPUT_ITEMS_JSON: ${{ github.event.inputs.items_json }}
+          SINGLE_ITEM_TIMEOUT: ${{ github.event.inputs.single_item_timeout }}
+          CHART_SCROLL_TIMES: ${{ github.event.inputs.chart_scroll_times }}
+          MAX_RETRIES: ${{ github.event.inputs.max_retries }}
+        run: |
+          if [ -n "$INPUT_ITEMS_JSON" ]; then
+            python scrape_test_v7.py --items-json "$INPUT_ITEMS_JSON"
+          else
+            echo "[ERROR] items_json is required"
+          fi
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: result
+          path: result.json
