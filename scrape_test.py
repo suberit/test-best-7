@@ -19,7 +19,7 @@ from playwright.sync_api import sync_playwright
 DETAIL_URL = "https://csqaq.com/goods/{goods_id}"
 RESULT_FILE = "result.json"
 
-CHART_SCROLL_TIMES = int(os.environ.get("CHART_SCROLL_TIMES", "5"))
+CHART_SCROLL_TIMES = 3  # 方向 C：减少翻页次数 5→3
 SINGLE_ITEM_TIMEOUT = int(os.environ.get("SINGLE_ITEM_TIMEOUT", "120"))
 
 
@@ -170,10 +170,10 @@ def scrape_one(page, goods_id, item_name=None):
                 before_resp_count = len(all_api_data.get(chart_url, []))
 
                 page.mouse.move(canvas_info["x"] + canvas_info["width"] / 2, center_y)
-                for _ in range(5):
-                    page.mouse.wheel(-1500, 0)
-                    page.wait_for_timeout(800)
-                page.wait_for_timeout(1500)
+                for _ in range(3):
+                    page.mouse.wheel(-3000, 0)
+                    page.wait_for_timeout(400)
+                page.wait_for_timeout(800)
 
                 current_resp_count = len(all_api_data.get(chart_url, []))
                 if current_resp_count > before_resp_count:
