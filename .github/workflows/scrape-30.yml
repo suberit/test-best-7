@@ -27,7 +27,7 @@ concurrency:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
@@ -37,23 +37,11 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        id: playwright-cache
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-python-v1
-
       - name: Install playwright
         run: pip install playwright
 
-      - name: Install Playwright Browsers (cache miss)
-        if: steps.playwright-cache.outputs.cache-hit != 'true'
-        run: python -m playwright install chromium
-
-      - name: Install browser dependencies (cache hit)
-        if: steps.playwright-cache.outputs.cache-hit == 'true'
-        run: python -m playwright install-deps chromium
+      - name: Install Playwright Browsers
+        run: python -m playwright install --with-deps chromium
 
       - name: Run scrape
         env:
