@@ -30,6 +30,16 @@ SCROLL_1H_TIMES = int(os.environ.get("SCROLL_1H_TIMES", "3"))
 SCROLL_WEEKLY_TIMES = int(os.environ.get("SCROLL_WEEKLY_TIMES", "3"))
 SINGLE_ITEM_TIMEOUT = int(os.environ.get("SINGLE_ITEM_TIMEOUT", "120"))
 
+# 方案 H：混合策略（日线用 E，1h 用 G）
+STRATEGY_MAP_H = {"日线": "e", "1h": "g", "周线": "g"}
+
+
+def get_strategy(period_name):
+    """获取指定 K 线类型的翻页策略"""
+    if WAIT_STRATEGY == "h":
+        return STRATEGY_MAP_H.get(period_name, "e")
+    return WAIT_STRATEGY
+
 API_CHART_ALL = "info/simple/chartAll"
 API_CHIP_DATA = "info/chipData"
 
@@ -175,7 +185,8 @@ def click_period(page, period_name):
 
 def scrape_one(page, goods_id, item_name=None):
     print(f"\n{'='*60}", flush=True)
-    print(f"  抓取饰品: goods_id={goods_id} name={item_name} 策略={WAIT_STRATEGY}", flush=True)
+    strategy_info = f"日线={get_strategy('日线')} 1h={get_strategy('1h')}" if WAIT_STRATEGY == "h" else f"策略={WAIT_STRATEGY}"
+    print(f"  抓取饰品: goods_id={goods_id} name={item_name} {strategy_info}", flush=True)
     print(f"{'='*60}", flush=True)
 
     detail_url = DETAIL_URL.format(goods_id=goods_id)
@@ -290,9 +301,10 @@ def scrape_one(page, goods_id, item_name=None):
         }""")
 
         if canvas_info:
-            all_chart_daily = do_scroll_loop(page, all_api_data, canvas_info, chart_url, WAIT_STRATEGY, CHART_SCROLL_TIMES, "日线")
+            daily_strategy = get_strategy("日线")
+            all_chart_daily = do_scroll_loop(page, all_api_data, canvas_info, chart_url, daily_strategy, CHART_SCROLL_TIMES, "日线")
             item_result["chart_daily"] = all_chart_daily
-            print(f"      ✓ 日线总计: {len(all_chart_daily)} 条", flush=True)
+            print(f"      ✓ 日线总计: {len(all_chart_daily)} 条 (策略={daily_strategy})", flush=True)
         else:
             print(f"      [警告] 未找到 canvas，跳过日线翻页", flush=True)
             new_data, _ = parse_chart_responses(all_api_data, chart_url, 0)
@@ -380,60 +392,15 @@ def scrape_one(page, goods_id, item_name=None):
         if canvas_info:
             # 清空之前 1h 的 API 响应计数，只获取 1h 切换后的数据
             before_1h_count = len(all_api_data.get(chart_url, []))
-            all_chart_1h = do_scroll_loop(page, all_api_data, canvas_info, chart_url, WAIT_STRATEGY, SCROLL_1H_TIMES, "1h")
+            h1_strategy = get_strategy("1h")
+            all_chart_1h = do_scroll_loop(page, all_api_data, canvas_info, chart_url, h1_strategy, SCROLL_1H_TIMES, "1h")
             item_result["chart_1h"] = all_chart_1h
-            print(f"      ✓ 1h 总计: {len(all_chart_1h)} 条", flush=True)
+            print(f"      ✓ 1h 总计: {len(all_chart_1h)} 条 (策略={h1_strategy})", flush=True)
         else:
             print(f"      [警告] 未找到 canvas，跳过 1h 翻页", flush=True)
 
-        # 7. 切换周线 + 翻页（3次）
-        print(f"  [7] 切换周线 + 翻页({SCROLL_WEEKLY_TIMES}次)...", flush=True)
-
-        # 等待 3s 让页面状态稳定
-        page.wait_for_timeout(3000)
-        click_period(page, "1小时")
-        page.wait_for_timeout(1000)
-
-        before_chart_count = get_api_count(all_api_data, API_CHART_ALL)
-        weekly_click = click_period(page, "周线")
-
-        if weekly_click:
-            print(f"      ✓ 点击周线成功: {weekly_click}", flush=True)
-            # 轮询等待 chartAll API 新响应
-            weekly_start = time.time()
-            weekly_success = False
-            while time.time() - weekly_start < 10:
-                current_count = get_api_count(all_api_data, API_CHART_ALL)
-                if current_count > before_chart_count:
-                    weekly_success = True
-                    break
-                page.wait_for_timeout(500)
-
-            if weekly_success:
-                page.wait_for_timeout(2000)
-
-                # 周线翻页
-                if canvas_info:
-                    canvas_info = page.evaluate("""() => {
-                        const canvas = document.querySelector('canvas');
-                        if (!canvas) return null;
-                        const rect = canvas.getBoundingClientRect();
-                        return {x: rect.x, y: rect.y, width: rect.width, height: rect.height};
-                    }""")
-
-                if canvas_info:
-                    before_weekly_count = len(all_api_data.get(chart_url, []))
-                    all_chart_weekly = do_scroll_loop(page, all_api_data, canvas_info, chart_url, WAIT_STRATEGY, SCROLL_WEEKLY_TIMES, "周线")
-                    item_result["chart_weekly"] = all_chart_weekly
-                    print(f"      ✓ 周线总计: {len(all_chart_weekly)} 条", flush=True)
-                else:
-                    new_data, _ = parse_chart_responses(all_api_data, chart_url, before_chart_count)
-                    item_result["chart_weekly"] = dedup_and_sort(new_data)
-                    print(f"      ✓ 周线(无翻页): {len(item_result['chart_weekly'])} 条", flush=True)
-            else:
-                print(f"      周线 API 无响应（{time.time()-weekly_start:.1f}s），跳过", flush=True)
-        else:
-            print(f"      [警告] 未找到周线按钮，跳过周线采集", flush=True)
+        # 7. 周线采集（CSQAQ 不支持周线，跳过）
+        print(f"  [7] 周线采集: 跳过（CSQAQ 不支持周线数据）", flush=True)
 
         # 8. 筹码分布（V5）
         print(f"  [8] 点击筹码分布图...", flush=True)
@@ -544,7 +511,9 @@ def main():
 
     print("=" * 60, flush=True)
     print(f"  CSQAQ 完整数据采集测试 (策略={WAIT_STRATEGY})", flush=True)
-    print(f"  日线翻页={CHART_SCROLL_TIMES} 1h翻页={SCROLL_1H_TIMES} 周线翻页={SCROLL_WEEKLY_TIMES}", flush=True)
+    if WAIT_STRATEGY == "h":
+        print(f"  方案H: 日线=E(300ms) 1h=G(500ms) 周线=跳过", flush=True)
+    print(f"  日线翻页={CHART_SCROLL_TIMES} 1h翻页={SCROLL_1H_TIMES} 周线翻页=跳过", flush=True)
     print("=" * 60, flush=True)
 
     items = []
