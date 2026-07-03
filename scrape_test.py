@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
-"""GitHub Actions Playwright 生产级抓取脚本 V11
+"""GitHub Actions Playwright 完整数据采集测试脚本
 
-在 GA runner 内运行，用 Playwright 抓取 CSQAQ 网页数据。
-输出 result.json（list 格式，兼容旧方法）。
+基于 V11，添加以下功能：
+- 1h 翻页（获取完整 1h 历史）
+- 周线采集（初始 + 翻页）
+- 可配置翻页等待策略（E/F/G 三种模式）
+- 翻页次数增加到 10 次
 
-V11 优化（基于 scrape_test_v4.py 验证）：
-- 移除 signal.alarm（破坏 Playwright 事件循环），改用 page.wait_for_timeout
-- networkidle + API 响应计数双重保障（替代固定等待）
-- V10（等待 3s + 重新激活日线 + 切换 1h）+ V9 补救（重新加载页面，先 1h）
-- V5 筹码分布（优先点击 BUTTON + 不二次点击 + 40s 超时）
-- page 无响应检测 + 自动恢复
-
-用法：
-  python scrape.py --items-json '[{"name":"AK-47","goods_id":"135"}]'
-  python scrape.py --text "AK-47" --goods-id "135"
+环境变量：
+  WAIT_STRATEGY: e/f/g（翻页等待策略）
+  CHART_SCROLL_TIMES: 日线翻页次数（默认 10）
+  SCROLL_1H_TIMES: 1h 翻页次数（默认 3）
+  SCROLL_WEEKLY_TIMES: 周线翻页次数（默认 3）
 """
 
 import argparse
@@ -26,37 +24,28 @@ from playwright.sync_api import sync_playwright
 DETAIL_URL = "https://csqaq.com/goods/{goods_id}"
 RESULT_FILE = "result.json"
 
-CHART_SCROLL_TIMES = int(os.environ.get("CHART_SCROLL_TIMES", "5"))
+WAIT_STRATEGY = os.environ.get("WAIT_STRATEGY", "e")
+CHART_SCROLL_TIMES = int(os.environ.get("CHART_SCROLL_TIMES", "10"))
+SCROLL_1H_TIMES = int(os.environ.get("SCROLL_1H_TIMES", "3"))
+SCROLL_WEEKLY_TIMES = int(os.environ.get("SCROLL_WEEKLY_TIMES", "3"))
 SINGLE_ITEM_TIMEOUT = int(os.environ.get("SINGLE_ITEM_TIMEOUT", "120"))
 
-# API URL 模式（用于智能等待关键 API 返回）
 API_CHART_ALL = "info/simple/chartAll"
 API_CHIP_DATA = "info/chipData"
 
 
 def wait_network_idle(page, timeout=15000):
-    """等待网络空闲（所有 API 请求完成）"""
     try:
         page.wait_for_load_state("networkidle", timeout=timeout)
     except Exception:
-        # networkidle 超时，回退到短等待
         page.wait_for_timeout(2000)
 
 
 def get_api_count(all_api_data, url_pattern):
-    """获取特定 API 的响应总数"""
     return sum(len(all_api_data[u]) for u in all_api_data if url_pattern in u)
 
 
 def wait_for_new_response(page, all_api_data, url_pattern, before_count, timeout=15):
-    """等待特定 API 出现新响应（通过响应计数）
-
-    networkidle 可能提前结束（500ms 无请求），但 API 可能还没返回。
-    此函数确保关键 API 的新响应已到达，避免数据丢失。
-
-    V11 修复：用 page.wait_for_timeout 替代 time.sleep，避免阻塞 Playwright 事件循环
-    （time.sleep 会阻塞事件循环，导致 page.on("response") 回调不触发，all_api_data 不更新）
-    """
     start = time.time()
     while time.time() - start < timeout:
         current_count = get_api_count(all_api_data, url_pattern)
@@ -66,10 +55,127 @@ def wait_for_new_response(page, all_api_data, url_pattern, before_count, timeout
     return False
 
 
+def scroll_and_wait(page, all_api_data, canvas_info, url_pattern, before_count, strategy=WAIT_STRATEGY):
+    """根据策略执行翻页 + 等待"""
+    center_y = canvas_info["y"] + canvas_info["height"] / 2
+    page.mouse.move(canvas_info["x"] + canvas_info["width"] / 2, center_y)
+
+    if strategy == "e":
+        # E: V11 networkidle + API计数 + 2000ms固定等待
+        for _ in range(5):
+            page.mouse.wheel(-1500, 0)
+            page.wait_for_timeout(300)
+        wait_network_idle(page, timeout=8000)
+        wait_for_new_response(page, all_api_data, url_pattern, before_count, timeout=8)
+        page.wait_for_timeout(2000)
+
+    elif strategy == "f":
+        # F: B方向固定等待 5500ms
+        for _ in range(5):
+            page.mouse.wheel(-1500, 0)
+            page.wait_for_timeout(800)
+        page.wait_for_timeout(1500)
+
+    elif strategy == "g":
+        # G: 混合 500ms×5 + networkidle + API计数 + 2000ms
+        for _ in range(5):
+            page.mouse.wheel(-1500, 0)
+            page.wait_for_timeout(500)
+        wait_network_idle(page, timeout=8000)
+        wait_for_new_response(page, all_api_data, url_pattern, before_count, timeout=8)
+        page.wait_for_timeout(2000)
+    else:
+        for _ in range(5):
+            page.mouse.wheel(-1500, 0)
+            page.wait_for_timeout(300)
+        wait_network_idle(page, timeout=8000)
+        page.wait_for_timeout(2000)
+
+
+def parse_chart_responses(all_api_data, chart_url, start_idx):
+    """解析 chartAll API 响应，返回新数据和新的索引"""
+    new_data = []
+    current_count = len(all_api_data.get(chart_url, []))
+    for idx in range(start_idx, current_count):
+        try:
+            parsed = json.loads(all_api_data[chart_url][idx]["body"])
+            if parsed.get("code") == 200:
+                arr = parsed.get("data", [])
+                if isinstance(arr, list):
+                    new_data.extend(arr)
+        except Exception:
+            pass
+    return new_data, current_count
+
+
+def dedup_and_sort(data_list, key="t"):
+    """去重并排序"""
+    seen = set()
+    unique = []
+    for item in data_list:
+        k = item.get(key)
+        if k and k not in seen:
+            seen.add(k)
+            unique.append(item)
+    unique.sort(key=lambda x: int(x.get(key, 0)))
+    return unique
+
+
+def do_scroll_loop(page, all_api_data, canvas_info, chart_url, strategy, scroll_times, period_name="日线"):
+    """通用翻页循环：日线/1h/周线共用"""
+    all_data = []
+    no_new_count = 0
+
+    # 获取初始数据
+    new_data, _ = parse_chart_responses(all_api_data, chart_url, 0)
+    all_data.extend(new_data)
+    print(f"      初始{period_name}: {len(new_data)} 条", flush=True)
+
+    for i in range(scroll_times):
+        before_total = len(all_data)
+        before_resp_count = len(all_api_data.get(chart_url, []))
+
+        scroll_and_wait(page, all_api_data, canvas_info, API_CHART_ALL, before_resp_count, strategy)
+
+        new_data, _ = parse_chart_responses(all_api_data, chart_url, before_resp_count)
+        all_data.extend(new_data)
+
+        if len(all_data) > before_total:
+            print(f"      {period_name}翻页 {i+1}: +{len(new_data)} 条, 总计 {len(all_data)} 条", flush=True)
+            no_new_count = 0
+        else:
+            no_new_count += 1
+            print(f"      {period_name}翻页 {i+1}: 无新数据 ({no_new_count}/3)", flush=True)
+            if no_new_count >= 3:
+                print(f"      连续 3 次无新数据，停止{period_name}翻页", flush=True)
+                break
+
+    return dedup_and_sort(all_data)
+
+
+def click_period(page, period_name):
+    """点击 K 线周期按钮"""
+    targets_map = {
+        "日线": ["日线"],
+        "1小时": ["1小时", "1H", "1h"],
+        "周线": ["周线", "W", "w", "1W", "1w"],
+    }
+    targets = targets_map.get(period_name, [period_name])
+    result = page.evaluate("""(targets) => {
+        const els = document.querySelectorAll('span, div, a, button, li');
+        for (const target of targets) {
+            for (const el of els) {
+                if (el.textContent.trim() === target && el.offsetParent !== null) { el.click(); return target; }
+            }
+        }
+        return false;
+    }""", targets)
+    return result
+
+
 def scrape_one(page, goods_id, item_name=None):
-    """抓取单个饰品数据（V11：networkidle + V10+V9 补救 + V5 筹码分布）"""
     print(f"\n{'='*60}", flush=True)
-    print(f"  抓取饰品: goods_id={goods_id} name={item_name}", flush=True)
+    print(f"  抓取饰品: goods_id={goods_id} name={item_name} 策略={WAIT_STRATEGY}", flush=True)
     print(f"{'='*60}", flush=True)
 
     detail_url = DETAIL_URL.format(goods_id=goods_id)
@@ -79,9 +185,11 @@ def scrape_one(page, goods_id, item_name=None):
         "detail": None,
         "chart_daily": [],
         "chart_1h": [],
+        "chart_weekly": [],
         "chip_data": None,
         "scrape_ok": False,
         "scrape_fail": "",
+        "wait_strategy": WAIT_STRATEGY,
     }
 
     all_api_data = {}
@@ -102,24 +210,18 @@ def scrape_one(page, goods_id, item_name=None):
 
     page.on("response", handle_response)
 
-    all_chart_daily = []
-    all_chart_1h = []
-    chip_full_data = None
-
     chart_url = "https://csqaq.com/proxies/api/v1/info/simple/chartAll"
-    chip_url = "https://csqaq.com/proxies/api/v1/info/chipData"
 
     try:
-        # 1. 访问详情页 + 等待网络空闲
-        print(f"  [1] 访问详情页（等待网络空闲）...", flush=True)
+        # 1. 访问详情页
+        print(f"  [1] 访问详情页...", flush=True)
         try:
             page.goto(detail_url, wait_until="networkidle", timeout=30000)
         except Exception:
-            # networkidle 超时，回退到 domcontentloaded + 短等待
             page.goto(detail_url, wait_until="domcontentloaded", timeout=30000)
             wait_network_idle(page)
 
-        # 2. 提取基本信息（从已捕获的 API 响应中）
+        # 2. 提取基本信息
         print(f"  [2] 提取基本信息...", flush=True)
         for url, responses in all_api_data.items():
             if "info/good" in url:
@@ -136,8 +238,8 @@ def scrape_one(page, goods_id, item_name=None):
                 except Exception as e:
                     print(f"      解析失败: {e}", flush=True)
 
-        # 3. 点击 K 线图 + 等待网络空闲
-        print(f"  [3] 点击 K 线图（等待网络空闲）...", flush=True)
+        # 3. 点击 K 线图
+        print(f"  [3] 点击 K 线图...", flush=True)
         page.evaluate("""() => {
             const buttons = document.querySelectorAll('button');
             for (const btn of buttons) {
@@ -147,8 +249,8 @@ def scrape_one(page, goods_id, item_name=None):
         }""")
         wait_network_idle(page)
 
-        # 4. 切换平台到悠悠有品 + 等待网络空闲
-        print(f"  [4] 切换平台到悠悠有品（等待网络空闲）...", flush=True)
+        # 4. 切换平台到悠悠有品
+        print(f"  [4] 切换平台到悠悠有品...", flush=True)
         select_info = page.evaluate("""() => {
             const selects = document.querySelectorAll('select');
             for (const sel of selects) {
@@ -175,27 +277,11 @@ def scrape_one(page, goods_id, item_name=None):
             wait_network_idle(page)
             print(f"      ✓ 切换完成", flush=True)
 
-        # 5. 切换日线 + 等待网络空闲
-        print(f"  [5] 切换日线（等待网络空闲）...", flush=True)
-        page.evaluate("""() => {
-            const els = document.querySelectorAll('span, div, a, button');
-            for (const el of els) {
-                if (el.textContent.trim() === '日线' && el.offsetParent !== null) { el.click(); return true; }
-            }
-            return false;
-        }""")
+        # 5. 切换日线 + 翻页（10次）
+        print(f"  [5] 切换日线 + 翻页({CHART_SCROLL_TIMES}次)...", flush=True)
+        click_period(page, "日线")
         wait_network_idle(page)
 
-        if chart_url in all_api_data and all_api_data[chart_url]:
-            parsed = json.loads(all_api_data[chart_url][-1]["body"])
-            if parsed.get("code") == 200:
-                arr = parsed.get("data", [])
-                if isinstance(arr, list):
-                    all_chart_daily.extend(arr)
-                    print(f"      初始日线: {len(arr)} 条", flush=True)
-
-        # 6. 翻页（每次等待网络空闲 + API 新响应）
-        print(f"  [6] 翻页（等待网络空闲 + chartAll API 新响应）...", flush=True)
         canvas_info = page.evaluate("""() => {
             const canvas = document.querySelector('canvas');
             if (!canvas) return null;
@@ -204,86 +290,26 @@ def scrape_one(page, goods_id, item_name=None):
         }""")
 
         if canvas_info:
-            center_y = canvas_info["y"] + canvas_info["height"] / 2
-            no_new_count = 0
+            all_chart_daily = do_scroll_loop(page, all_api_data, canvas_info, chart_url, WAIT_STRATEGY, CHART_SCROLL_TIMES, "日线")
+            item_result["chart_daily"] = all_chart_daily
+            print(f"      ✓ 日线总计: {len(all_chart_daily)} 条", flush=True)
+        else:
+            print(f"      [警告] 未找到 canvas，跳过日线翻页", flush=True)
+            new_data, _ = parse_chart_responses(all_api_data, chart_url, 0)
+            item_result["chart_daily"] = dedup_and_sort(new_data)
 
-            for i in range(CHART_SCROLL_TIMES):
-                before_total = len(all_chart_daily)
-                before_resp_count = len(all_api_data.get(chart_url, [])) if chart_url else 0
+        # 6. 切换 1 小时 + 翻页（3次）
+        print(f"  [6] 切换 1 小时 + 翻页({SCROLL_1H_TIMES}次)...", flush=True)
 
-                page.mouse.move(canvas_info["x"] + canvas_info["width"] / 2, center_y)
-                for _ in range(5):
-                    page.mouse.wheel(-1500, 0)
-                    page.wait_for_timeout(300)
-
-                # 等待网络空闲 + chartAll API 新响应（双重保障）
-                wait_network_idle(page, timeout=8000)
-                if not wait_for_new_response(page, all_api_data, API_CHART_ALL, before_resp_count, timeout=8):
-                    # API 没有新响应，短等待
-                    page.wait_for_timeout(1000)
-
-                current_resp_count = len(all_api_data.get(chart_url, []))
-                if current_resp_count > before_resp_count:
-                    for idx in range(before_resp_count, current_resp_count):
-                        parsed = json.loads(all_api_data[chart_url][idx]["body"])
-                        if parsed.get("code") == 200:
-                            arr = parsed.get("data", [])
-                            if isinstance(arr, list) and len(arr) > 0:
-                                all_chart_daily.extend(arr)
-                                print(f"      翻页 {i+1}: +{len(arr)} 条, 总计 {len(all_chart_daily)} 条", flush=True)
-
-                if len(all_chart_daily) == before_total:
-                    no_new_count += 1
-                    if no_new_count >= 3:
-                        print(f"      连续 3 次无新数据，停止翻页", flush=True)
-                        break
-                else:
-                    no_new_count = 0
-
-        # 去重日线
-        seen_t = set()
-        unique_daily = []
-        for item in all_chart_daily:
-            t = item.get("t")
-            if t and t not in seen_t:
-                seen_t.add(t)
-                unique_daily.append(item)
-        all_chart_daily = unique_daily
-        all_chart_daily.sort(key=lambda x: int(x.get("t", 0)))
-        item_result["chart_daily"] = all_chart_daily
-        print(f"      ✓ 日线总计: {len(all_chart_daily)} 条", flush=True)
-
-        # 7. 切换 1 小时（V11：V10 为主 + V9 补救）
-        # V10：翻页后等待 3s + 重新激活日线 + 切换 1h（成功时 1h=346）
-        # V9 补救：V10 失败时重新加载页面，先 1h（1h=150）
-        print(f"  [7] 切换 1 小时（V11：V10 为主 + V9 补救）...", flush=True)
-
-        # V10 方式：等待 3s 让页面状态稳定
+        # V10 方式：等待 3s + 重新激活日线 + 切换 1h
         page.wait_for_timeout(3000)
-        # 重新点击日线按钮（激活日线状态，翻页后页面 JS 状态可能损坏）
-        page.evaluate("""() => {
-            const els = document.querySelectorAll('span, div, a, button');
-            for (const el of els) {
-                if (el.textContent.trim() === '日线' && el.offsetParent !== null) { el.click(); return true; }
-            }
-            return false;
-        }""")
+        click_period(page, "日线")
         page.wait_for_timeout(1000)
 
-        # 切换 1h
         before_chart_count = get_api_count(all_api_data, API_CHART_ALL)
-        page.evaluate("""() => {
-            const targets = ['1小时', '1H', '1h'];
-            const els = document.querySelectorAll('span, div, a, button, li');
-            for (const target of targets) {
-                for (const el of els) {
-                    if (el.textContent.trim() === target && el.offsetParent !== null) { el.click(); return true; }
-                }
-            }
-            return false;
-        }""")
+        click_result = click_period(page, "1小时")
 
-        # 轮询等待 chartAll API 新响应（V10：5s 超时，成功通常 0.5s）
+        # 轮询等待 chartAll API 新响应
         v10_start = time.time()
         v10_success = False
         while time.time() - v10_start < 5:
@@ -294,29 +320,17 @@ def scrape_one(page, goods_id, item_name=None):
             page.wait_for_timeout(500)
 
         if v10_success:
-            # 等待数据完整
             page.wait_for_timeout(2000)
-            if chart_url in all_api_data and all_api_data[chart_url]:
-                latest_idx = len(all_api_data[chart_url]) - 1
-                try:
-                    parsed = json.loads(all_api_data[chart_url][latest_idx]["body"])
-                    if parsed.get("code") == 200:
-                        arr = parsed.get("data", [])
-                        if isinstance(arr, list):
-                            all_chart_1h.extend(arr)
-                            print(f"      ✓ V10 成功 ({time.time()-v10_start:.1f}s): 1 小时 {len(arr)} 条", flush=True)
-                except Exception as e:
-                    print(f"      V10 解析失败: {e}", flush=True)
+            print(f"      ✓ V10 切换 1h 成功 ({time.time()-v10_start:.1f}s)", flush=True)
         else:
-            # V9 补救：重新加载页面，先 1h（不翻页）
-            print(f"      V10 失败 ({time.time()-v10_start:.1f}s)，启用 V9 补救...", flush=True)
+            # V9 补救：重新加载页面
+            print(f"      V10 失败，启用 V9 补救...", flush=True)
             try:
                 page.goto(detail_url, wait_until="networkidle", timeout=30000)
             except Exception:
                 page.goto(detail_url, wait_until="domcontentloaded", timeout=30000)
                 wait_network_idle(page)
 
-            # 点击 K 线图
             page.evaluate("""() => {
                 const buttons = document.querySelectorAll('button');
                 for (const btn of buttons) {
@@ -326,7 +340,6 @@ def scrape_one(page, goods_id, item_name=None):
             }""")
             wait_network_idle(page)
 
-            # 切换平台到悠悠有品
             if select_info:
                 page.evaluate("""(targetValue) => {
                     const selects = document.querySelectorAll('select');
@@ -342,57 +355,92 @@ def scrape_one(page, goods_id, item_name=None):
                 }""", select_info["value"])
                 wait_network_idle(page)
 
-            # 切换日线（激活）
-            page.evaluate("""() => {
-                const els = document.querySelectorAll('span, div, a, button');
-                for (const el of els) {
-                    if (el.textContent.trim() === '日线' && el.offsetParent !== null) { el.click(); return true; }
-                }
-                return false;
-            }""")
+            click_period(page, "日线")
             wait_network_idle(page)
 
-            # 切换 1h
             before_chart_count = get_api_count(all_api_data, API_CHART_ALL)
-            page.evaluate("""() => {
-                const targets = ['1小时', '1H', '1h'];
-                const els = document.querySelectorAll('span, div, a, button, li');
-                for (const target of targets) {
-                    for (const el of els) {
-                        if (el.textContent.trim() === target && el.offsetParent !== null) { el.click(); return true; }
-                    }
-                }
-                return false;
-            }""")
+            click_period(page, "1小时")
 
-            # 轮询等待 chartAll API 新响应（V9：20s 超时）
             if not wait_for_new_response(page, all_api_data, API_CHART_ALL, before_chart_count, timeout=20):
                 print(f"      V9 补救也失败", flush=True)
             else:
                 page.wait_for_timeout(2000)
-                if chart_url in all_api_data and all_api_data[chart_url]:
-                    latest_idx = len(all_api_data[chart_url]) - 1
-                    try:
-                        parsed = json.loads(all_api_data[chart_url][latest_idx]["body"])
-                        if parsed.get("code") == 200:
-                            arr = parsed.get("data", [])
-                            if isinstance(arr, list):
-                                all_chart_1h.extend(arr)
-                                print(f"      ✓ V9 补救成功: 1 小时 {len(arr)} 条", flush=True)
-                    except Exception as e:
-                        print(f"      V9 解析失败: {e}", flush=True)
+                print(f"      ✓ V9 补救成功", flush=True)
 
-        item_result["chart_1h"] = all_chart_1h
+        # 1h 翻页
+        if canvas_info:
+            # 重新获取 canvas（V9 可能重新加载了页面）
+            canvas_info = page.evaluate("""() => {
+                const canvas = document.querySelector('canvas');
+                if (!canvas) return null;
+                const rect = canvas.getBoundingClientRect();
+                return {x: rect.x, y: rect.y, width: rect.width, height: rect.height};
+            }""")
 
-        # 8. 筹码分布（V5：优先点击 BUTTON + 不二次点击 + 40 秒超时）
+        if canvas_info:
+            # 清空之前 1h 的 API 响应计数，只获取 1h 切换后的数据
+            before_1h_count = len(all_api_data.get(chart_url, []))
+            all_chart_1h = do_scroll_loop(page, all_api_data, canvas_info, chart_url, WAIT_STRATEGY, SCROLL_1H_TIMES, "1h")
+            item_result["chart_1h"] = all_chart_1h
+            print(f"      ✓ 1h 总计: {len(all_chart_1h)} 条", flush=True)
+        else:
+            print(f"      [警告] 未找到 canvas，跳过 1h 翻页", flush=True)
+
+        # 7. 切换周线 + 翻页（3次）
+        print(f"  [7] 切换周线 + 翻页({SCROLL_WEEKLY_TIMES}次)...", flush=True)
+
+        # 等待 3s 让页面状态稳定
+        page.wait_for_timeout(3000)
+        click_period(page, "1小时")
+        page.wait_for_timeout(1000)
+
+        before_chart_count = get_api_count(all_api_data, API_CHART_ALL)
+        weekly_click = click_period(page, "周线")
+
+        if weekly_click:
+            print(f"      ✓ 点击周线成功: {weekly_click}", flush=True)
+            # 轮询等待 chartAll API 新响应
+            weekly_start = time.time()
+            weekly_success = False
+            while time.time() - weekly_start < 10:
+                current_count = get_api_count(all_api_data, API_CHART_ALL)
+                if current_count > before_chart_count:
+                    weekly_success = True
+                    break
+                page.wait_for_timeout(500)
+
+            if weekly_success:
+                page.wait_for_timeout(2000)
+
+                # 周线翻页
+                if canvas_info:
+                    canvas_info = page.evaluate("""() => {
+                        const canvas = document.querySelector('canvas');
+                        if (!canvas) return null;
+                        const rect = canvas.getBoundingClientRect();
+                        return {x: rect.x, y: rect.y, width: rect.width, height: rect.height};
+                    }""")
+
+                if canvas_info:
+                    before_weekly_count = len(all_api_data.get(chart_url, []))
+                    all_chart_weekly = do_scroll_loop(page, all_api_data, canvas_info, chart_url, WAIT_STRATEGY, SCROLL_WEEKLY_TIMES, "周线")
+                    item_result["chart_weekly"] = all_chart_weekly
+                    print(f"      ✓ 周线总计: {len(all_chart_weekly)} 条", flush=True)
+                else:
+                    new_data, _ = parse_chart_responses(all_api_data, chart_url, before_chart_count)
+                    item_result["chart_weekly"] = dedup_and_sort(new_data)
+                    print(f"      ✓ 周线(无翻页): {len(item_result['chart_weekly'])} 条", flush=True)
+            else:
+                print(f"      周线 API 无响应（{time.time()-weekly_start:.1f}s），跳过", flush=True)
+        else:
+            print(f"      [警告] 未找到周线按钮，跳过周线采集", flush=True)
+
+        # 8. 筹码分布（V5）
         print(f"  [8] 点击筹码分布图...", flush=True)
         try:
-            # 点击前等待 1 秒（确保 JS 加载）
             page.wait_for_timeout(1000)
 
-            # 优先点击 BUTTON 元素（.chip_tag___2aXfK 是 SPAN，点击它不触发 API）
             click_result = page.evaluate("""() => {
-                // 1. 优先点击包含"筹码分布图"文本的 BUTTON
                 const buttons = document.querySelectorAll('button');
                 for (const btn of buttons) {
                     const text = btn.textContent.trim();
@@ -400,12 +448,10 @@ def scrape_one(page, goods_id, item_name=None):
                         btn.click(); return 'button:' + text;
                     }
                 }
-                // 2. 点击 .chip_tag___2aXfK 的父元素（BUTTON）
                 const chipEl = document.querySelector('.chip_tag___2aXfK');
                 if (chipEl && chipEl.parentElement) {
                     chipEl.parentElement.click(); return 'parent';
                 }
-                // 3. 文本匹配兜底
                 const els = document.querySelectorAll('span, div, a, button, li, p');
                 for (const el of els) {
                     const text = el.textContent.trim();
@@ -417,9 +463,6 @@ def scrape_one(page, goods_id, item_name=None):
             }""")
             print(f"      点击返回: {click_result}", flush=True)
 
-            # 轮询等待 chipData API 响应（最多 40 秒，摩托手套需要 12-34 秒）
-            # 不二次点击（二次点击会取消第一次的 API 请求）
-            # 用 page.wait_for_timeout() 等待（不阻塞事件循环）
             chip_found = False
             chip_start = time.time()
             while time.time() - chip_start < 40:
@@ -440,15 +483,13 @@ def scrape_one(page, goods_id, item_name=None):
                     break
                 page.wait_for_timeout(500)
 
-            elapsed = time.time() - chip_start
             if not chip_found:
-                print(f"      chipData API 无响应（{elapsed:.1f}s），跳过", flush=True)
+                print(f"      chipData API 无响应（{time.time()-chip_start:.1f}s），跳过", flush=True)
 
         except Exception as e:
             print(f"      [筹码分布异常] {type(e).__name__}: {e}，跳过", flush=True)
             item_result["scrape_fail"] = f"筹码分布异常: {type(e).__name__}"
 
-        # 标记成功
         if item_result["detail"]:
             item_result["scrape_ok"] = True
         else:
@@ -463,21 +504,17 @@ def scrape_one(page, goods_id, item_name=None):
 
 
 def scrape_with_retry(page, goods_id, item_name=None, max_retries=None):
-    """带重试的抓取（移除 signal.alarm，避免破坏 Playwright 事件循环）"""
     if max_retries is None:
         max_retries = int(os.environ.get("MAX_RETRIES", "1"))
     for attempt in range(max_retries + 1):
         try:
             result = scrape_one(page, goods_id, item_name)
-
             if result["scrape_ok"]:
                 return result
-
             if attempt < max_retries:
                 print(f"  [重试] 第 {attempt+1} 次失败，重试中...", flush=True)
             else:
                 print(f"  [失败] 重试次数已用完", flush=True)
-
         except Exception as e:
             if attempt < max_retries:
                 print(f"  [异常重试] {type(e).__name__}，重试中...", flush=True)
@@ -490,24 +527,26 @@ def scrape_with_retry(page, goods_id, item_name=None, max_retries=None):
         "detail": None,
         "chart_daily": [],
         "chart_1h": [],
+        "chart_weekly": [],
         "chip_data": None,
         "scrape_ok": False,
         "scrape_fail": "重试失败",
+        "wait_strategy": WAIT_STRATEGY,
     }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CSQAQ Playwright 抓取 V11")
+    parser = argparse.ArgumentParser(description="CSQAQ 完整数据采集测试")
     parser.add_argument("--items-json", default="", help="批量 JSON 数组")
     parser.add_argument("--text", default="", help="单 item 饰品名称")
     parser.add_argument("--goods-id", default="", help="单 item 饰品ID")
     args = parser.parse_args()
 
     print("=" * 60, flush=True)
-    print("  CSQAQ Playwright 抓取 V11（networkidle + V10+V9 补救）", flush=True)
+    print(f"  CSQAQ 完整数据采集测试 (策略={WAIT_STRATEGY})", flush=True)
+    print(f"  日线翻页={CHART_SCROLL_TIMES} 1h翻页={SCROLL_1H_TIMES} 周线翻页={SCROLL_WEEKLY_TIMES}", flush=True)
     print("=" * 60, flush=True)
 
-    # 解析 items
     items = []
     if args.items_json:
         try:
@@ -552,7 +591,6 @@ def main():
                 try:
                     result = scrape_with_retry(page, item["goods_id"], item.get("name"))
 
-                    # 检测页面是否仍然响应（防止 JS 卡死后继续操作）
                     try:
                         page.wait_for_function("() => true", timeout=5000)
                     except Exception:
@@ -565,7 +603,6 @@ def main():
                         page.set_default_timeout(30000)
 
                 except Exception as e:
-                    # Playwright 事件循环损坏，重新创建 page
                     print(f"  [FATAL] {type(e).__name__}: {e}", flush=True)
                     print(f"  [恢复] 重新创建 page...", flush=True)
                     try:
@@ -580,9 +617,11 @@ def main():
                         "detail": None,
                         "chart_daily": [],
                         "chart_1h": [],
+                        "chart_weekly": [],
                         "chip_data": None,
                         "scrape_ok": False,
                         "scrape_fail": f"事件循环损坏: {type(e).__name__}",
+                        "wait_strategy": WAIT_STRATEGY,
                     }
 
                 results.append(result)
@@ -590,9 +629,10 @@ def main():
                 name = result["name"] or "N/A"
                 daily_n = len(result["chart_daily"])
                 h1_n = len(result["chart_1h"])
+                weekly_n = len(result["chart_weekly"])
                 chip_n = len(result["chip_data"].get("date", [])) if result["chip_data"] else 0
                 ok = "✓" if result["scrape_ok"] else "✗"
-                print(f"  → {ok} {name}: 日线{daily_n} 1h{h1_n} 筹码{chip_n}", flush=True)
+                print(f"  → {ok} {name}: 日线{daily_n} 1h{h1_n} 周线{weekly_n} 筹码{chip_n}", flush=True)
 
             browser.close()
 
@@ -602,17 +642,15 @@ def main():
     end_time = datetime.datetime.now()
     duration = (end_time - start_time).total_seconds()
 
-    # 保存结果
     with open(RESULT_FILE, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False)
 
-    # 汇总
     success_count = sum(1 for r in results if r["scrape_ok"])
     print(f"\n{'='*60}", flush=True)
     print(f"  汇总: {success_count}/{len(items)} 成功, 耗时 {duration:.0f}s", flush=True)
     for r in results:
         ok = "✓" if r["scrape_ok"] else "✗"
-        print(f"    [{r['goods_id']}] {ok} {r['name']}", flush=True)
+        print(f"    [{r['goods_id']}] {ok} {r['name']}: 日线{len(r['chart_daily'])} 1h{len(r['chart_1h'])} 周线{len(r['chart_weekly'])} 筹码{len(r['chip_data'].get('date', [])) if r['chip_data'] else 0}", flush=True)
 
 
 if __name__ == "__main__":
