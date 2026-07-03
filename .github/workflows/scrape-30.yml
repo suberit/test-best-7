@@ -19,6 +19,18 @@ on:
         description: '最大重试次数'
         required: false
         default: '1'
+      wait_strategy:
+        description: '等待策略 e/f/g'
+        required: false
+        default: 'e'
+      scroll_1h_times:
+        description: '1h翻页次数'
+        required: false
+        default: '3'
+      scroll_weekly_times:
+        description: '周线翻页次数'
+        required: false
+        default: '3'
 
 concurrency:
   group: scrape-${{ github.repository }}
@@ -27,7 +39,7 @@ concurrency:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - uses: actions/checkout@v4
@@ -49,6 +61,9 @@ jobs:
           SINGLE_ITEM_TIMEOUT: ${{ github.event.inputs.single_item_timeout }}
           CHART_SCROLL_TIMES: ${{ github.event.inputs.chart_scroll_times }}
           MAX_RETRIES: ${{ github.event.inputs.max_retries }}
+          WAIT_STRATEGY: ${{ github.event.inputs.wait_strategy }}
+          SCROLL_1H_TIMES: ${{ github.event.inputs.scroll_1h_times }}
+          SCROLL_WEEKLY_TIMES: ${{ github.event.inputs.scroll_weekly_times }}
         run: |
           if [ -n "$INPUT_ITEMS_JSON" ]; then
             python scrape_test.py --items-json "$INPUT_ITEMS_JSON"
